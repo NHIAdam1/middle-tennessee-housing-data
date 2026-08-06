@@ -2,7 +2,6 @@ import csv
 import gzip
 import io
 import os
-import sys
 import urllib.request
 from datetime import datetime
 
@@ -26,73 +25,125 @@ def pick(row, *names):
     return ""
 
 
-def county_name(value):
-    value = value.strip()
-    if value.upper().endswith(", TN"):
-        value = value[:-4]
+def normalize_county(value):
+    value = (value or "").strip()
+
+    # Examples handled:
+    # Davidson County, TN
+    # Davidson County
+    # Davidson, TN
+    if "," in value:
+        value = value.split(",", 1)[0].strip()
+
     if value.lower().endswith(" county"):
-        value = value[:-7]
-    return value.strip().title()
+        value = value[:-7].strip()
+
+    return value.title()
 
 
 def parse_month(value):
-    value = value.strip()
-    if not value:
-        return ""
+    text = (value or "").strip()
+
     for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
         try:
-            return datetime.strptime(value[:10], fmt).strftime("%Y-%m")
+            return datetime.strptime(text[:10], fmt).strftime("%Y-%m")
         except ValueError:
             pass
-    return value[:7] if len(value) >= 7 else ""
+
+    return text[:7] if len(text) >= 7 else ""
+
+
+def parse_number(value):
+    text = (value or "").replace(",", "").strip()
+
+    if not text or text.upper() in {"NA", "N/A", "NULL"}:
+        return None
+
+    try:
+        return int(round(float(text)))
+    except ValueError:
+        return None
+
+
+def is_all_residential(value):
+    text = (value or "").strip().lower()
+
+    # Accept blank aggregate rows and common Redfin aggregate labels.
+    return text in {
+        "",
+        "all residential",
+        "all residential homes",
+        "all",
+        "all homes",
+    }
 
 
 def main():
     print("Downloading Redfin county dataset...")
+
     request = urllib.request.Request(
         SOURCE_URL,
-        headers={"User-Agent": "Middle-Tennessee-Market-Share/1.0"}
+        headers={"User-Agent": "Middle-Tennessee-Market-Share/2.0"}
     )
-    with urllib.request.urlopen(request, timeout=180) as response:
+
+    with urllib.request.urlopen(request, timeout=240) as response:
         compressed = response.read()
 
     print(f"Downloaded {len(compressed):,} bytes.")
 
-    with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as gz:
-        text_stream = io.TextIOWrapper(gz, encoding="utf-8", newline="")
-        reader = csv.DictReader(text_stream, delimiter="\t")
+    selected = {}
+    tennessee_rows = 0
+    target_county_rows = 0
+    property_rows = 0
 
-        selected = {}
+    with gzip.GzipFile(fileobj=io.BytesIO(compressed)) as gz:
+        stream = io.TextIOWrapper(gz, encoding="utf-8", newline="")
+        reader = csv.DictReader(stream, delimiter="\t")
+
+        print("Detected columns:")
+        print(", ".join(reader.fieldnames or []))
+
         for row in reader:
             state_code = pick(row, "STATE_CODE", "STATE CODE").upper()
             state_name = pick(row, "STATE").lower()
-            if state_code != "TN" and state_name != "tennessee":
+            region = pick(row, "REGION", "REGION_NAME", "REGION NAME")
+
+            # Some Redfin county rows expose Tennessee through the region
+            # suffix even when state fields are blank.
+            is_tennessee = (
+                state_code == "TN"
+                or state_name == "tennessee"
+                or region.upper().endswith(", TN")
+            )
+            if not is_tennessee:
                 continue
+
+            tennessee_rows += 1
+
+            county = normalize_county(region)
+            if county not in TARGET_COUNTIES:
+                continue
+
+            target_county_rows += 1
 
             region_type = pick(row, "REGION_TYPE", "REGION TYPE").lower()
             if region_type and "county" not in region_type:
                 continue
 
-            property_type = pick(row, "PROPERTY_TYPE", "PROPERTY TYPE").lower()
-            if property_type not in ("", "all residential", "all residential homes", "all"):
+            property_type = pick(row, "PROPERTY_TYPE", "PROPERTY TYPE")
+            if not is_all_residential(property_type):
                 continue
 
-            duration = pick(row, "PERIOD_DURATION", "PERIOD DURATION").lower()
-            if duration and "month" not in duration and duration != "1":
-                continue
+            property_rows += 1
 
-            county = county_name(pick(row, "REGION", "REGION_NAME", "REGION NAME"))
-            if county not in TARGET_COUNTIES:
-                continue
+            reporting_month = parse_month(
+                pick(row, "PERIOD_BEGIN", "PERIOD BEGIN")
+            )
+            homes_sold = parse_number(
+                pick(row, "HOMES_SOLD", "HOMES SOLD")
+            )
 
-            reporting_month = parse_month(pick(row, "PERIOD_BEGIN", "PERIOD BEGIN"))
-            homes_sold_raw = pick(row, "HOMES_SOLD", "HOMES SOLD").replace(",", "")
-            if not reporting_month or not homes_sold_raw or homes_sold_raw.upper() == "NA":
-                continue
-
-            try:
-                homes_sold = int(round(float(homes_sold_raw)))
-            except ValueError:
+            if not reporting_month or homes_sold is None:
                 continue
 
             selected[(reporting_month, county)] = {
@@ -103,23 +154,35 @@ def main():
                 "Source": "Redfin County Market Tracker",
             }
 
+    print(f"Tennessee rows found: {tennessee_rows:,}")
+    print(f"Target-county rows found: {target_county_rows:,}")
+    print(f"Aggregate residential rows found: {property_rows:,}")
+
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+
     rows = [selected[key] for key in sorted(selected)]
 
     with open(OUTPUT_PATH, "w", newline="", encoding="utf-8") as output:
         writer = csv.DictWriter(
             output,
             fieldnames=[
-                "Reporting Month", "County", "State",
-                "Residential Closings", "Source"
+                "Reporting Month",
+                "County",
+                "State",
+                "Residential Closings",
+                "Source",
             ],
         )
         writer.writeheader()
         writer.writerows(rows)
 
     print(f"Wrote {len(rows):,} filtered rows to {OUTPUT_PATH}.")
+
     if not rows:
-        raise RuntimeError("No Tennessee county rows were found.")
+        raise RuntimeError(
+            "No output rows were produced. Review the diagnostic counts "
+            "and detected columns above."
+        )
 
 
 if __name__ == "__main__":
